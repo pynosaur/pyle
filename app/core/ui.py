@@ -4,6 +4,7 @@
 # 2026-04-08
 
 import curses
+import shutil
 import time
 from pathlib import Path
 from .scanner import (
@@ -306,6 +307,7 @@ def run_ui(stdscr, start_path):
     scanner = LazyScanner(current_path)
     entries = scanner.entries
     all_entries = entries          # unfiltered reference
+    disk_total = shutil.disk_usage(current_path).total
     total = 0
     cursor = 0
     scroll_offset = 0
@@ -323,7 +325,10 @@ def run_ui(stdscr, start_path):
 
         if scanner.dirty.is_set():
             scanner.dirty.clear()
-            total = sum(e["size"] for e in all_entries if e["size"] > 0)
+            total = min(
+                sum(e["size"] for e in all_entries if e["size"] > 0),
+                disk_total,
+            )
             _sort_entries(all_entries, sort_by_name)
             if search_query:
                 filtered_entries = [
@@ -463,9 +468,10 @@ def run_ui(stdscr, start_path):
                 scanner.stop()
                 history.append((
                     current_path, cursor, scroll_offset,
-                    scanner, all_entries, total,
+                    scanner, all_entries, total, disk_total,
                 ))
                 current_path = entries[cursor]["path"]
+                disk_total = shutil.disk_usage(current_path).total
                 scanner = LazyScanner(current_path)
                 all_entries = scanner.entries
                 entries = all_entries
@@ -486,12 +492,14 @@ def run_ui(stdscr, start_path):
                 all_entries = prev[4]
                 entries = all_entries
                 total = prev[5]
+                disk_total = prev[6]
                 search_mode = False
                 search_query = ""
             elif current_path.parent != current_path:
                 scanner.stop()
                 old_name = current_path.name
                 current_path = current_path.parent
+                disk_total = shutil.disk_usage(current_path).total
                 scanner = LazyScanner(current_path)
                 all_entries = scanner.entries
                 entries = all_entries
@@ -510,6 +518,7 @@ def run_ui(stdscr, start_path):
         elif key == ord("r"):
             scanner.stop()
             invalidate_cache(str(current_path))
+            disk_total = shutil.disk_usage(current_path).total
             scanner = LazyScanner(current_path)
             all_entries = scanner.entries
             entries = all_entries

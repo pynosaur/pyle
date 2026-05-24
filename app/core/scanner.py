@@ -4,11 +4,47 @@
 # 2026-04-08
 
 import os
+import subprocess
 import threading
 from pathlib import Path
 
 _size_cache = {}
 _cache_lock = threading.Lock()
+
+_mount_points = None
+_mount_lock = threading.Lock()
+
+
+def _get_mount_points():
+    """Parse system mount table to get actual mount points.
+    Cached after first call."""
+    global _mount_points
+    if _mount_points is not None:
+        return _mount_points
+    with _mount_lock:
+        if _mount_points is not None:
+            return _mount_points
+        mounts = set()
+        try:
+            output = subprocess.check_output(
+                ["mount"], text=True, timeout=5, stderr=subprocess.DEVNULL,
+            )
+            for line in output.splitlines():
+                parts = line.split(" on ", 1)
+                if len(parts) == 2:
+                    paren_idx = parts[1].rfind(" (")
+                    if paren_idx > 0:
+                        mounts.add(parts[1][:paren_idx])
+        except (subprocess.SubprocessError, OSError):
+            pass
+        _mount_points = mounts
+        return _mount_points
+
+
+def _is_mount_point(path):
+    """Check if path is a mount point using the system mount table."""
+    mounts = _get_mount_points()
+    return path in mounts or str(path) in mounts
 
 
 def _disk_usage(st):
@@ -59,10 +95,13 @@ def bar_string(ratio, width):
 def dir_size(path, _depth=0, _max_depth=50, _cancel=None):
     """Recursive directory size using os.scandir (C-backed).
     Stops at _max_depth to prevent hangs on circular or very deep trees.
+    Skips mount points to avoid counting other filesystems.
     Checks _cancel event between entries to allow early exit."""
     if _depth > _max_depth:
         return 0
     if _cancel is not None and _cancel.is_set():
+        return 0
+    if _depth > 0 and _is_mount_point(path):
         return 0
 
     key = str(path)
@@ -352,6 +391,13 @@ class LazyScanner:
             self._wait_if_paused()
             if self.cancel.is_set():
                 return
+
+            if _is_mount_point(str(entry["path"])):
+                entry["size"] = 0
+                self.dirs_sized += 1
+                self.dirty.set()
+                return
+
             entry["size"] = 0
             self.dirty.set()
             try:
@@ -371,7 +417,8 @@ class LazyScanner:
                                 )
                             elif child.is_dir(follow_symlinks=False):
                                 entry["size"] += dir_size(
-                                    child.path, _cancel=self.cancel,
+                                    child.path, _depth=1,
+                                    _cancel=self.cancel,
                                 )
                         except (PermissionError, OSError):
                             continue
@@ -434,9 +481,12 @@ def compute_sizes_async(entries, callback, cancel=None):
             if cancel.is_set():
                 return
             if entry["is_dir"] and entry["size"] < 0:
-                size = dir_size(
-                    str(entry["path"]), _cancel=cancel,
-                )
+                p = str(entry["path"])
+                if _is_mount_point(p):
+                    entry["size"] = 0
+                    callback()
+                    continue
+                size = dir_size(p, _cancel=cancel)
                 if cancel.is_set():
                     return
                 entry["size"] = size
