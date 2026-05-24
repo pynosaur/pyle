@@ -128,9 +128,21 @@ class TestDirSize(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
 
+    def _file_disk_usage(self, path):
+        st = os.stat(path)
+        try:
+            return st.st_blocks * 512
+        except AttributeError:
+            return st.st_size
+
     def test_total_size(self):
+        expected = (
+            self._file_disk_usage(Path(self.tmpdir, "a.txt"))
+            + self._file_disk_usage(Path(self.tmpdir, "b.txt"))
+            + self._file_disk_usage(Path(self.tmpdir, "sub", "c.txt"))
+        )
         total = dir_size(Path(self.tmpdir))
-        self.assertEqual(total, 12)
+        self.assertEqual(total, expected)
 
     def test_empty_dir(self):
         empty = Path(self.tmpdir) / "empty"
