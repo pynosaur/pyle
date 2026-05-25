@@ -4,47 +4,30 @@
 # 2026-04-08
 
 import os
-import subprocess
 import threading
 from pathlib import Path
 
 _size_cache = {}
 _cache_lock = threading.Lock()
 
-_mount_points = None
-_mount_lock = threading.Lock()
+def _is_cross_device(path, root_dev):
+    """Check if path is on a different filesystem than root_dev.
+    This catches mount points, macOS firmlinks, and APFS volume boundaries
+    without needing to parse mount tables."""
+    if root_dev is None:
+        return False
+    try:
+        return os.lstat(path).st_dev != root_dev
+    except (OSError, ValueError):
+        return False
 
 
-def _get_mount_points():
-    """Parse system mount table to get actual mount points.
-    Cached after first call."""
-    global _mount_points
-    if _mount_points is not None:
-        return _mount_points
-    with _mount_lock:
-        if _mount_points is not None:
-            return _mount_points
-        mounts = set()
-        try:
-            output = subprocess.check_output(
-                ["mount"], text=True, timeout=5, stderr=subprocess.DEVNULL,
-            )
-            for line in output.splitlines():
-                parts = line.split(" on ", 1)
-                if len(parts) == 2:
-                    paren_idx = parts[1].rfind(" (")
-                    if paren_idx > 0:
-                        mounts.add(parts[1][:paren_idx])
-        except (subprocess.SubprocessError, OSError):
-            pass
-        _mount_points = mounts
-        return _mount_points
-
-
-def _is_mount_point(path):
-    """Check if path is a mount point using the system mount table."""
-    mounts = _get_mount_points()
-    return path in mounts or str(path) in mounts
+def _get_dev(path):
+    """Get the device ID for a path."""
+    try:
+        return os.lstat(path).st_dev
+    except OSError:
+        return None
 
 
 def _disk_usage(st):
@@ -92,16 +75,21 @@ def bar_string(ratio, width):
     return "#" * filled + " " * (width - filled)
 
 
-def dir_size(path, _depth=0, _max_depth=50, _cancel=None):
+def dir_size(path, _depth=0, _max_depth=50, _cancel=None, _root_dev=None):
     """Recursive directory size using os.scandir (C-backed).
     Stops at _max_depth to prevent hangs on circular or very deep trees.
-    Skips mount points to avoid counting other filesystems.
+    Skips directories on different filesystems (detects mount points,
+    macOS firmlinks, and APFS volume boundaries via st_dev comparison).
     Checks _cancel event between entries to allow early exit."""
     if _depth > _max_depth:
         return 0
     if _cancel is not None and _cancel.is_set():
         return 0
-    if _depth > 0 and _is_mount_point(path):
+
+    if _root_dev is None:
+        _root_dev = _get_dev(path)
+
+    if _depth > 0 and _is_cross_device(path, _root_dev):
         return 0
 
     key = str(path)
@@ -123,7 +111,7 @@ def dir_size(path, _depth=0, _max_depth=50, _cancel=None):
                     elif entry.is_dir(follow_symlinks=False):
                         total += dir_size(
                             entry.path, _depth + 1, _max_depth,
-                            _cancel,
+                            _cancel, _root_dev,
                         )
                 except (PermissionError, OSError):
                     continue
@@ -382,7 +370,8 @@ class LazyScanner:
             self.dirty.set()
             return
 
-        workers = min(8, len(snapshot))
+        workers = min(16, len(snapshot))
+        root_dev = _get_dev(self.path)
 
         def _size_one(entry):
             """Size a directory incrementally: walk its immediate children
@@ -392,16 +381,18 @@ class LazyScanner:
             if self.cancel.is_set():
                 return
 
-            if _is_mount_point(str(entry["path"])):
+            entry_path = str(entry["path"])
+            if _is_cross_device(entry_path, root_dev):
                 entry["size"] = 0
                 self.dirs_sized += 1
                 self.dirty.set()
                 return
 
+            entry_dev = _get_dev(entry_path)
             entry["size"] = 0
             self.dirty.set()
             try:
-                with os.scandir(str(entry["path"])) as it:
+                with os.scandir(entry_path) as it:
                     for child in it:
                         self._wait_if_paused()
                         if self.cancel.is_set():
@@ -419,6 +410,7 @@ class LazyScanner:
                                 entry["size"] += dir_size(
                                     child.path, _depth=1,
                                     _cancel=self.cancel,
+                                    _root_dev=entry_dev,
                                 )
                         except (PermissionError, OSError):
                             continue
@@ -427,9 +419,8 @@ class LazyScanner:
                         self.dirty.set()
             except (PermissionError, OSError):
                 pass
-            # Cache the final result
             with _cache_lock:
-                _size_cache[str(entry["path"])] = entry["size"]
+                _size_cache[entry_path] = entry["size"]
             self.dirs_sized += 1
             self.dirty.set()
 
@@ -469,7 +460,7 @@ class LazyScanner:
         return not self.sizing_done
 
 
-def compute_sizes_async(entries, callback, cancel=None):
+def compute_sizes_async(entries, callback, cancel=None, root_dev=None):
     """Compute dir sizes in background thread.
     Calls callback() after each entry is resolved.
     Returns (thread, cancel_event) so caller can stop stale scans."""
@@ -482,11 +473,11 @@ def compute_sizes_async(entries, callback, cancel=None):
                 return
             if entry["is_dir"] and entry["size"] < 0:
                 p = str(entry["path"])
-                if _is_mount_point(p):
+                if _is_cross_device(p, root_dev):
                     entry["size"] = 0
                     callback()
                     continue
-                size = dir_size(p, _cancel=cancel)
+                size = dir_size(p, _cancel=cancel, _root_dev=root_dev)
                 if cancel.is_set():
                     return
                 entry["size"] = size
