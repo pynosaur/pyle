@@ -1,6 +1,6 @@
 NAME: pyle
 FULL_NAME: "Python Lite Explorer"
-VERSION: "0.3.9"
+VERSION: "0.4.0"
 DESCRIPTION: >
   Interactive disk usage explorer with a curses-based TUI. Browse directories
   sorted by size, navigate with arrow keys, enter subdirectories, and see
@@ -29,6 +29,7 @@ KEYBINDINGS:
   - "PgUp/PgDn         Page up/down"
   - "g/G               Jump to first/last entry"
   - "s                 Toggle sort: size (default) / name"
+  - "b                 Toggle bubble (treemap) view"
   - "d                 Delete selected entry (with confirmation)"
   - "r                 Refresh/rescan current directory"
   - "q/Esc             Quit"

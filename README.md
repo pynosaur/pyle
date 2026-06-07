@@ -31,6 +31,7 @@ pyle --version
 | `PgUp` / `PgDn` | Page up / down |
 | `g` / `G` | Jump to first / last entry |
 | `s` | Toggle sort: size (default) / name |
+| `b` | Toggle bubble (treemap) view |
 | `d` | Delete selected entry (confirms first) |
 | `r` | Refresh / rescan current directory |
 | `q` / `Esc` | Quit |
