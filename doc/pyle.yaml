@@ -1,6 +1,6 @@
 NAME: pyle
 FULL_NAME: "Python Lite Explorer"
-VERSION: "0.4.0"
+VERSION: "0.4.1"
 DESCRIPTION: >
   Interactive disk usage explorer with a curses-based TUI. Browse directories
   sorted by size, navigate with arrow keys, enter subdirectories, and see

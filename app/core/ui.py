@@ -4,7 +4,9 @@
 # 2026-04-08
 
 import curses
+import os
 import shutil
+import stat
 import time
 from pathlib import Path
 from .scanner import (
@@ -1017,7 +1019,14 @@ def run_ui(stdscr, start_path):
                     else:
                         # Delete failed: keep the entry and tell the user why
                         # so it doesn't silently "reappear" later.
-                        err = f" delete failed: {deleter.error} "
+                        detail = deleter.error or ""
+                        hint = ""
+                        if ("Permission denied" in detail
+                                or "Errno 13" in detail
+                                or "Errno 1" in detail
+                                or "not permitted" in detail):
+                            hint = "  (root-owned/protected: try sudo pyle)"
+                        err = f" delete failed: {detail}{hint} "
                         stdscr.move(max_y - 1, 0)
                         stdscr.clrtoeol()
                         _safe_addnstr(
@@ -1069,8 +1078,7 @@ class _AsyncDelete:
             if self.path.is_symlink() or self.path.is_file():
                 with self._lock:
                     self.current = self.path.name
-                self.path.unlink()
-                self.count = 1
+                self._force_unlink(self.path)
             elif self.path.is_dir():
                 self._rmtree(self.path)
         except OSError as exc:
@@ -1089,7 +1097,49 @@ class _AsyncDelete:
 
         self.done = True
 
+    def _ensure_writable(self, path):
+        """Add owner write+exec so a dir's children can be removed.
+        Removing an entry needs write+exec on its PARENT directory, so this
+        is called on directories before unlinking their contents. Best
+        effort: chmod itself fails on root-owned paths (needs sudo)."""
+        try:
+            mode = os.lstat(path).st_mode
+            if not (mode & stat.S_IWUSR) or not (mode & stat.S_IXUSR):
+                os.chmod(path, mode | stat.S_IRWXU)
+        except OSError:
+            pass
+
+    def _force_unlink(self, child):
+        """Unlink a file/symlink; on failure make the parent dir writable
+        and retry once before giving up."""
+        try:
+            child.unlink()
+            self.count += 1
+            return
+        except OSError:
+            self._ensure_writable(child.parent)
+            try:
+                child.unlink()
+                self.count += 1
+            except OSError as exc:
+                if self.error is None:
+                    self.error = str(exc)
+
+    def _force_rmdir(self, path):
+        try:
+            path.rmdir()
+            return
+        except OSError:
+            self._ensure_writable(path.parent)
+            try:
+                path.rmdir()
+            except OSError as exc:
+                if self.error is None:
+                    self.error = str(exc)
+
     def _rmtree(self, path):
+        # Need write+exec on this dir to list and remove its children.
+        self._ensure_writable(path)
         try:
             for child in path.iterdir():
                 if child.is_dir() and not child.is_symlink():
@@ -1097,13 +1147,8 @@ class _AsyncDelete:
                 else:
                     with self._lock:
                         self.current = child.name
-                    try:
-                        child.unlink()
-                        self.count += 1
-                    except OSError as exc:
-                        if self.error is None:
-                            self.error = str(exc)
-            path.rmdir()
+                    self._force_unlink(child)
         except OSError as exc:
             if self.error is None:
                 self.error = str(exc)
+        self._force_rmdir(path)
