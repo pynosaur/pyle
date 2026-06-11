@@ -1,6 +1,6 @@
 NAME: pyle
 FULL_NAME: "Python Lite Explorer"
-VERSION: "0.4.1"
+VERSION: "0.5.0"
 DESCRIPTION: >
   Interactive disk usage explorer with a curses-based TUI. Browse directories
   sorted by size, navigate with arrow keys, enter subdirectories, and see
@@ -48,5 +48,6 @@ NOTES:
   - "Symlinks are not followed; their own size is reported."
   - "Permission-denied directories show [!] and size 0."
   - "Delete (d) asks for confirmation; removes files and directories recursively."
+  - "If direct removal is blocked (read-only or protected trees), the entry is moved to the Trash instead."
   - "Pure Python — no external dependencies. Uses curses (stdlib)."
   - "Works on macOS and Linux. Windows requires windows-curses."

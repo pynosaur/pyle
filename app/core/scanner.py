@@ -4,11 +4,19 @@
 # 2026-04-08
 
 import os
+import queue
 import threading
 from pathlib import Path
 
 _size_cache = {}
 _cache_lock = threading.Lock()
+
+_MAX_DEPTH = 50
+_WORKERS = 16
+# Directories at or above this depth are enqueued as separate work items
+# so all workers share the load; deeper subtrees are sized inline with
+# the recursive fast path to avoid per-directory queue overhead.
+_SPLIT_DEPTH = 2
 
 def _is_cross_device(path, root_dev):
     """Check if path is on a different filesystem than root_dev.
@@ -40,14 +48,34 @@ def _disk_usage(st):
 
 
 def invalidate_cache(path=None):
+    """Drop cached sizes for path and everything beneath it.
+    Matches on path-component boundaries so '/a/b' does not
+    accidentally invalidate '/a/bc'."""
     with _cache_lock:
         if path is None:
             _size_cache.clear()
         else:
             key = str(path)
-            to_remove = [k for k in _size_cache if k.startswith(key)]
+            prefix = key.rstrip(os.sep) + os.sep
+            to_remove = [
+                k for k in _size_cache
+                if k == key or k.startswith(prefix)
+            ]
             for k in to_remove:
                 del _size_cache[k]
+
+
+def invalidate_ancestors(path):
+    """Drop cached totals for path's ancestors (exact keys only).
+    Used after a delete: every parent total is stale, but sibling
+    subtrees are still valid and should keep their caches."""
+    p = Path(path)
+    with _cache_lock:
+        while True:
+            _size_cache.pop(str(p), None)
+            if p.parent == p:
+                break
+            p = p.parent
 
 
 def format_size(size_bytes):
@@ -75,7 +103,9 @@ def bar_string(ratio, width):
     return "#" * filled + " " * (width - filled)
 
 
-def dir_size(path, _depth=0, _max_depth=50, _cancel=None, _root_dev=None):
+def dir_size(
+    path, _depth=0, _max_depth=_MAX_DEPTH, _cancel=None, _root_dev=None,
+):
     """Recursive directory size using os.scandir (C-backed).
     Stops at _max_depth to prevent hangs on circular or very deep trees.
     Skips directories on different filesystems (detects mount points,
@@ -250,10 +280,27 @@ def scan_directory_shallow(path):
     return entries, total
 
 
+class _DirNode:
+    """One directory in the sizing work queue.
+    Tracks its running total and how many child directories are still
+    being sized, so finished totals can propagate to the parent."""
+
+    __slots__ = ("path", "parent", "entry", "depth", "total", "pending")
+
+    def __init__(self, path, parent, entry, depth):
+        self.path = path
+        self.parent = parent
+        self.entry = entry
+        self.depth = depth
+        self.total = 0
+        self.pending = 0
+
+
 class LazyScanner:
     """Streams directory entries + sizes in background threads.
     Phase 1: list entries (files get instant sizes, dirs get -1).
-    Phase 2: compute dir sizes one by one.
+    Phase 2: size all pending directories via a shared work queue
+    spanning the whole tree (see _phase_sizes).
     The UI polls .entries, .listing_done, .sizing_done each tick."""
 
     def __init__(self, path, cancel=None):
@@ -362,75 +409,143 @@ class LazyScanner:
         return None
 
     def _phase_sizes(self):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        """Size all pending directories with a shared work queue.
 
+        Every worker pulls directories from anywhere in the tree, so a
+        single huge subdirectory no longer pins one thread while the
+        rest sit idle. Totals are aggregated bottom-up through _DirNode
+        parents, which keeps the per-directory size cache populated for
+        instant navigation."""
         snapshot = [e for e in self.entries if e["is_dir"] and e["size"] < 0]
         if not snapshot:
             self.sizing_done = True
             self.dirty.set()
             return
 
-        workers = min(16, len(snapshot))
         root_dev = _get_dev(self.path)
+        work = queue.Queue()
+        agg_lock = threading.Lock()
+        outstanding = [0]
+        all_done = threading.Event()
 
-        def _size_one(entry):
-            """Size a directory incrementally: walk its immediate children
-            one by one, updating the entry after each so the UI shows
-            the size growing in real time."""
+        def _push(node):
+            with agg_lock:
+                outstanding[0] += 1
+            work.put(node)
+
+        def _task_done():
+            with agg_lock:
+                outstanding[0] -= 1
+                if outstanding[0] == 0:
+                    all_done.set()
+
+        def _finalize_locked(node):
+            """Walk finished totals up the tree (agg_lock held).
+            Caches each completed directory and snaps the top-level
+            entry to its exact total once its whole subtree is done."""
+            while node is not None:
+                with _cache_lock:
+                    _size_cache[node.path] = node.total
+                parent = node.parent
+                if parent is None:
+                    node.entry["size"] = node.total
+                    self.dirs_sized += 1
+                    break
+                parent.total += node.total
+                parent.pending -= 1
+                if parent.pending > 0:
+                    break
+                node = parent
+
+        def _process(node):
             self._wait_if_paused()
             if self.cancel.is_set():
                 return
 
-            entry_path = str(entry["path"])
-            if _is_cross_device(entry_path, root_dev):
-                entry["size"] = 0
-                self.dirs_sized += 1
-                self.dirty.set()
-                return
-
-            entry_dev = _get_dev(entry_path)
-            entry["size"] = 0
-            self.dirty.set()
+            split = node.depth < _SPLIT_DEPTH
+            local = 0
+            children = []
+            cached_sum = 0
             try:
-                with os.scandir(entry_path) as it:
+                with os.scandir(node.path) as it:
                     for child in it:
-                        self._wait_if_paused()
                         if self.cancel.is_set():
                             return
                         try:
-                            if child.is_symlink():
-                                entry["size"] += _disk_usage(
+                            if child.is_dir(follow_symlinks=False):
+                                if node.depth + 1 > _MAX_DEPTH:
+                                    continue
+                                if not split:
+                                    sub = dir_size(
+                                        child.path,
+                                        _depth=node.depth + 1,
+                                        _cancel=self.cancel,
+                                        _root_dev=root_dev,
+                                    )
+                                    local += sub
+                                    continue
+                                st = child.stat(follow_symlinks=False)
+                                if root_dev is not None \
+                                        and st.st_dev != root_dev:
+                                    continue
+                                with _cache_lock:
+                                    cached = _size_cache.get(child.path)
+                                if cached is not None:
+                                    cached_sum += cached
+                                else:
+                                    children.append(child.path)
+                            else:
+                                local += _disk_usage(
                                     child.stat(follow_symlinks=False),
-                                )
-                            elif child.is_file(follow_symlinks=False):
-                                entry["size"] += _disk_usage(
-                                    child.stat(follow_symlinks=False),
-                                )
-                            elif child.is_dir(follow_symlinks=False):
-                                entry["size"] += dir_size(
-                                    child.path, _depth=1,
-                                    _cancel=self.cancel,
-                                    _root_dev=entry_dev,
                                 )
                         except (PermissionError, OSError):
                             continue
-                        if self.cancel.is_set():
-                            return
-                        self.dirty.set()
             except (PermissionError, OSError):
                 pass
-            with _cache_lock:
-                _size_cache[entry_path] = entry["size"]
-            self.dirs_sized += 1
+
+            with agg_lock:
+                node.total = local + cached_sum
+                node.pending = len(children)
+                if node.entry["size"] < 0:
+                    node.entry["size"] = 0
+                node.entry["size"] += local + cached_sum
+                if node.pending == 0:
+                    _finalize_locked(node)
+                for child_path in children:
+                    outstanding[0] += 1
+                    work.put(_DirNode(
+                        child_path, node, node.entry, node.depth + 1,
+                    ))
             self.dirty.set()
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_size_one, e): e for e in snapshot}
-            for fut in as_completed(futures):
-                if self.cancel.is_set():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    return
+        def _worker():
+            while not self.cancel.is_set() and not all_done.is_set():
+                try:
+                    node = work.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    _process(node)
+                finally:
+                    _task_done()
 
+        for entry in snapshot:
+            _push(_DirNode(str(entry["path"]), None, entry, 1))
+
+        workers = [
+            threading.Thread(target=_worker, daemon=True)
+            for _ in range(_WORKERS)
+        ]
+        for t in workers:
+            t.start()
+
+        while not all_done.is_set():
+            if self.cancel.is_set():
+                return
+            all_done.wait(0.1)
+
+        if self.cancel.is_set():
+            return
         self.sizing_done = True
         self.dirty.set()
 

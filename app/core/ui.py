@@ -7,12 +7,13 @@ import curses
 import os
 import shutil
 import stat
+import sys
 import time
 from pathlib import Path
 from .scanner import (
     LazyScanner,
     format_size, size_ratio, bar_string,
-    invalidate_cache,
+    invalidate_cache, invalidate_ancestors,
 )
 
 
@@ -74,9 +75,12 @@ def draw_header(stdscr, current_path, total_size, max_x, scanner, tick=0,
         if dirs > 0:
             done = scanner.dirs_sized
             pct = int(done * 100 / dirs)
-            total_str = f"[{spin}] {pct}% ({done}/{dirs}) {format_size(total_size)} "
+            total_str = (
+                f"[{spin}] sizing {done}/{dirs} dirs ({pct}%)"
+                f"  {format_size(total_size)} so far "
+            )
         else:
-            total_str = f"[{spin}] scanning... "
+            total_str = f"[{spin}] listing entries... "
     elif disk_used is not None and disk_total is not None:
         total_str = (
             f"Size: {format_size(total_size)}  "
@@ -163,10 +167,10 @@ def draw_status(stdscr, row, scanner, entries, cursor, max_x):
 
     left = f" {dirs} dirs, {files} files"
     if not scanner.listing_done:
-        left += " [listing...]"
+        left += " [listing entries...]"
     elif scanner.is_scanning:
         done = scanner.dirs_sized
-        left += f" [{done}/{dirs} sized]"
+        left += f" [sizing {done}/{dirs} dirs]"
 
     right = ""
     if entry:
@@ -548,6 +552,7 @@ def run_ui(stdscr, start_path):
     skip_confirm = False
     tick = 0
     last_recompute = 0.0          # throttle dirty-driven recompute
+    flash_msg = ""                # one-shot status note (cleared on keypress)
 
     # Search state
     search_mode = False
@@ -573,6 +578,11 @@ def run_ui(stdscr, start_path):
         ):
             scanner.dirty.clear()
             last_recompute = now
+            # Remember the selected entry so the cursor follows it when
+            # streaming sizes re-sort the list under the user.
+            sel_entry = None
+            if entries and cursor < len(entries):
+                sel_entry = entries[cursor]
             total = sum(e["size"] for e in all_entries if e["size"] > 0)
             _sort_entries(all_entries, sort_by_name)
             if search_query:
@@ -583,6 +593,11 @@ def run_ui(stdscr, start_path):
                 entries = filtered_entries
             else:
                 entries = all_entries
+            if sel_entry is not None:
+                for i, e in enumerate(entries):
+                    if e is sel_entry:
+                        cursor = i
+                        break
 
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
@@ -716,7 +731,13 @@ def run_ui(stdscr, start_path):
                 draw_search_bar(stdscr, max_y - 1, search_query, max_x)
             else:
                 curses.curs_set(0)
-                draw_help(stdscr, max_y - 1, max_x)
+                if flash_msg:
+                    _safe_addnstr(
+                        stdscr, max_y - 1, 0, flash_msg[:max_x], max_x,
+                        curses.A_BOLD,
+                    )
+                else:
+                    draw_help(stdscr, max_y - 1, max_x)
 
         stdscr.refresh()
 
@@ -724,6 +745,8 @@ def run_ui(stdscr, start_path):
 
         if key == -1:
             continue
+
+        flash_msg = ""
 
         # ── Bubble mode input ─────────────────────────────────────────────
         if bubble_mode:
@@ -756,6 +779,13 @@ def run_ui(stdscr, start_path):
                     entries = all_entries
                     total = prev[5]
                     disk_total = prev[6]
+                    if not scanner.sizing_done:
+                        # The saved scan was stopped when we left this
+                        # directory; restart it (cached dirs are instant).
+                        scanner = LazyScanner(current_path)
+                        all_entries = scanner.entries
+                        entries = all_entries
+                        total = 0
                     search_mode = False
                     search_query = ""
                     bubble_cursor = 0
@@ -909,6 +939,13 @@ def run_ui(stdscr, start_path):
                 entries = all_entries
                 total = prev[5]
                 disk_total = prev[6]
+                if not scanner.sizing_done:
+                    # The saved scan was stopped when we left this
+                    # directory; restart it (cached dirs are instant).
+                    scanner = LazyScanner(current_path)
+                    all_entries = scanner.entries
+                    entries = all_entries
+                    total = 0
                 search_mode = False
                 search_query = ""
             elif current_path.parent != current_path:
@@ -1010,12 +1047,18 @@ def run_ui(stdscr, start_path):
                             scanner.files_count -= 1
                         if removed["size"] > 0:
                             total -= removed["size"]
-                        # Invalidate the deleted path AND the current dir so
-                        # stale parent sizes recompute on the next rescan.
+                        # Drop caches for the deleted subtree, then the
+                        # exact totals of every ancestor (their sums are
+                        # stale, but sibling subtrees are still valid).
                         invalidate_cache(str(target))
-                        invalidate_cache(str(current_path))
+                        invalidate_ancestors(str(current_path))
                         if cursor >= len(entries) and entries:
                             cursor = len(entries) - 1
+                        if deleter.trashed:
+                            flash_msg = (
+                                f" moved to Trash: {removed['name']}"
+                                " (direct delete was blocked)"
+                            )
                     else:
                         # Delete failed: keep the entry and tell the user why
                         # so it doesn't silently "reappear" later.
@@ -1059,7 +1102,13 @@ import threading
 
 
 class _AsyncDelete:
-    """Delete a path in a background thread with progress tracking."""
+    """Delete a path in a background thread with progress tracking.
+    Tries direct removal first (fixing read-only modes and immutable
+    flags along the way). If that is still blocked, falls back to
+    moving the entry into the user's Trash: a rename only needs write
+    permission on the source and destination parents, so it works for
+    trees whose contents cannot be unlinked (e.g. protected .app
+    bundles under /Applications)."""
 
     def __init__(self, path):
         self.path = path
@@ -1067,6 +1116,7 @@ class _AsyncDelete:
         self.current = ""
         self.done = False
         self.error = None
+        self.trashed = False
         self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run, daemon=True,
@@ -1092,10 +1142,75 @@ class _AsyncDelete:
             still_there = self.path.exists() or self.path.is_symlink()
         except OSError:
             still_there = True
-        if still_there and self.error is None:
-            self.error = "could not delete (permission denied?)"
+
+        if still_there:
+            if self._move_to_trash():
+                self.trashed = True
+                self.error = None
+            elif self.error is None:
+                self.error = "could not delete (permission denied?)"
 
         self.done = True
+
+    def _trash_dir(self):
+        """Locate (or create) the user's trash directory."""
+        home = Path.home()
+        if sys.platform == "darwin":
+            trash = home / ".Trash"
+            return trash if trash.is_dir() else None
+        base = Path(
+            os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share")),
+        )
+        files = base / "Trash" / "files"
+        try:
+            files.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return files
+
+    def _move_to_trash(self):
+        """Rename the target into the trash under a unique name."""
+        trash = self._trash_dir()
+        if trash is None:
+            return False
+        dest = trash / self.path.name
+        n = 1
+        while dest.exists() or dest.is_symlink():
+            n += 1
+            dest = trash / f"{self.path.name} {n}"
+        try:
+            os.rename(self.path, dest)
+        except OSError:
+            return False
+        self._write_trashinfo(dest)
+        return True
+
+    def _write_trashinfo(self, dest):
+        """Record the freedesktop .trashinfo entry (Linux only)."""
+        if sys.platform == "darwin":
+            return
+        info_dir = dest.parent.parent / "info"
+        try:
+            info_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+            (info_dir / f"{dest.name}.trashinfo").write_text(
+                f"[Trash Info]\nPath={self.path}\nDeletionDate={stamp}\n",
+            )
+        except OSError:
+            pass
+
+    def _clear_flags(self, path):
+        """Clear BSD file flags (uchg, uappnd, ...) that make unlink
+        fail even for the owner. No-op on platforms without chflags."""
+        chflags = getattr(os, "lchflags", None) or getattr(
+            os, "chflags", None,
+        )
+        if chflags is None:
+            return
+        try:
+            chflags(str(path), 0)
+        except OSError:
+            pass
 
     def _ensure_writable(self, path):
         """Add owner write+exec so a dir's children can be removed.
@@ -1110,14 +1225,15 @@ class _AsyncDelete:
             pass
 
     def _force_unlink(self, child):
-        """Unlink a file/symlink; on failure make the parent dir writable
-        and retry once before giving up."""
+        """Unlink a file/symlink; on failure make the parent dir writable,
+        clear immutable flags, and retry once before giving up."""
         try:
             child.unlink()
             self.count += 1
             return
         except OSError:
             self._ensure_writable(child.parent)
+            self._clear_flags(child)
             try:
                 child.unlink()
                 self.count += 1
@@ -1131,6 +1247,7 @@ class _AsyncDelete:
             return
         except OSError:
             self._ensure_writable(path.parent)
+            self._clear_flags(path)
             try:
                 path.rmdir()
             except OSError as exc:
