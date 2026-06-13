@@ -7,6 +7,7 @@ import curses
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1068,7 +1069,12 @@ def run_ui(stdscr, start_path):
                                 or "Errno 13" in detail
                                 or "Errno 1" in detail
                                 or "not permitted" in detail):
-                            hint = "  (root-owned/protected: try sudo pyle)"
+                            if sys.platform == "darwin":
+                                hint = ("  (protected item: approve the macOS"
+                                        " prompt, or it is SIP-locked)")
+                            else:
+                                hint = ("  (root-owned: needs elevated"
+                                        " privileges)")
                         err = f" delete failed: {detail}{hint} "
                         stdscr.move(max_y - 1, 0)
                         stdscr.clrtoeol()
@@ -1103,12 +1109,18 @@ import threading
 
 class _AsyncDelete:
     """Delete a path in a background thread with progress tracking.
-    Tries direct removal first (fixing read-only modes and immutable
-    flags along the way). If that is still blocked, falls back to
-    moving the entry into the user's Trash: a rename only needs write
-    permission on the source and destination parents, so it works for
-    trees whose contents cannot be unlinked (e.g. protected .app
-    bundles under /Applications)."""
+
+    Order of attempts:
+    1. Direct removal, fixing read-only modes and immutable flags.
+    2. A plain rename into the user's Trash. This works for files and
+       for directories the user owns, but NOT for a directory owned by
+       another user (e.g. a root:wheel .app bundle): moving a directory
+       to a new parent updates its `..` entry, which needs write
+       permission on the directory itself, so rename(2) returns EACCES.
+    3. macOS only: ask Finder to move the item to Trash. Finder can
+       authorize removal of protected/root-owned bundles (the same way
+       dragging an app to the Trash in the GUI does), covering the
+       /Applications case that steps 1-2 cannot."""
 
     def __init__(self, path):
         self.path = path
@@ -1169,21 +1181,52 @@ class _AsyncDelete:
         return files
 
     def _move_to_trash(self):
-        """Rename the target into the trash under a unique name."""
+        """Move the target to Trash. Try a plain rename first (fast and
+        silent for owned items); on macOS fall back to Finder, which can
+        authorize protected/root-owned items a rename cannot move."""
         trash = self._trash_dir()
-        if trash is None:
-            return False
-        dest = trash / self.path.name
-        n = 1
-        while dest.exists() or dest.is_symlink():
-            n += 1
-            dest = trash / f"{self.path.name} {n}"
+        if trash is not None:
+            dest = trash / self.path.name
+            n = 1
+            while dest.exists() or dest.is_symlink():
+                n += 1
+                dest = trash / f"{self.path.name} {n}"
+            try:
+                os.rename(self.path, dest)
+                self._write_trashinfo(dest)
+                return True
+            except OSError:
+                pass
+        if sys.platform == "darwin":
+            return self._macos_finder_trash()
+        return False
+
+    def _macos_finder_trash(self):
+        """Ask Finder to move the item to Trash (recoverable). Finder
+        prompts for authorization on protected/root-owned items, so this
+        succeeds where a plain rename hits EACCES. No shell is used and
+        the path is passed as an argument, not interpolated."""
+        script = (
+            "on run argv\n"
+            "  set p to POSIX file (item 1 of argv) as alias\n"
+            '  tell application "Finder" to delete p\n'
+            "end run"
+        )
         try:
-            os.rename(self.path, dest)
+            proc = subprocess.run(
+                ["osascript", "-e", script, str(self.path)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if proc.returncode != 0:
+            return False
+        try:
+            return not (self.path.exists() or self.path.is_symlink())
         except OSError:
             return False
-        self._write_trashinfo(dest)
-        return True
 
     def _write_trashinfo(self, dest):
         """Record the freedesktop .trashinfo entry (Linux only)."""

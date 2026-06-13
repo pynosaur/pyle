@@ -333,6 +333,65 @@ class TestAsyncDelete(unittest.TestCase):
         self.assertIsNone(deleter.error)
         self.assertFalse(top.exists())
 
+    def _patch_macos_rename_fail(self, stack, run_result):
+        import unittest.mock as mock
+        stack.enter_context(
+            mock.patch("app.core.ui.sys.platform", "darwin"),
+        )
+        stack.enter_context(
+            mock.patch(
+                "app.core.ui.os.rename",
+                side_effect=OSError(13, "Permission denied"),
+            ),
+        )
+        return stack.enter_context(
+            mock.patch("app.core.ui.subprocess.run", **run_result),
+        )
+
+    def test_move_to_trash_falls_back_to_finder_on_macos(self):
+        """When a plain rename cannot move the item, macOS should defer
+        to Finder. Verify the fallback is invoked and the osascript
+        command is built safely (path passed as an argument)."""
+        import contextlib
+        import unittest.mock as mock
+        from app.core.ui import _AsyncDelete
+
+        deleter = _AsyncDelete.__new__(_AsyncDelete)
+        deleter.path = Path(self.tmpdir, "Pretend.app")
+        deleter.path.mkdir()
+
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            shutil.rmtree(deleter.path, ignore_errors=True)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with contextlib.ExitStack() as stack:
+            self._patch_macos_rename_fail(stack, {"side_effect": fake_run})
+            ok = deleter._move_to_trash()
+
+        self.assertTrue(ok)
+        self.assertEqual(captured["args"][0], "osascript")
+        self.assertIn(str(deleter.path), captured["args"])
+
+    def test_move_to_trash_finder_failure_is_reported(self):
+        import contextlib
+        import unittest.mock as mock
+        from app.core.ui import _AsyncDelete
+
+        deleter = _AsyncDelete.__new__(_AsyncDelete)
+        deleter.path = Path(self.tmpdir, "Locked.app")
+        deleter.path.mkdir()
+
+        failed = mock.Mock(returncode=1, stdout="", stderr="denied")
+        with contextlib.ExitStack() as stack:
+            self._patch_macos_rename_fail(stack, {"return_value": failed})
+            ok = deleter._move_to_trash()
+
+        self.assertFalse(ok)
+        self.assertTrue(deleter.path.exists())
+
 
 class TestVersionConsistency(unittest.TestCase):
     """All version references must match. CI catches drift."""
